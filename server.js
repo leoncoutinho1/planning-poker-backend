@@ -142,6 +142,30 @@ const redisHelpers = {
       return 0;
     }
     return await redisClient.sCard('rooms:list');
+  },
+
+  // Verificar e excluir sala se estiver vazia
+  async cleanupEmptyRoom(roomId) {
+    if (!this.isConnected()) {
+      return false;
+    }
+    try {
+      const room = await this.getRoom(roomId);
+      if (!room) {
+        return false; // Sala já não existe
+      }
+
+      // Verificar se a sala está vazia (sem usuários)
+      if (!room.users || room.users.size === 0) {
+        console.log(`[cleanup] Sala ${roomId} está vazia, excluindo...`);
+        await this.deleteRoom(roomId);
+        return true; // Sala foi excluída
+      }
+      return false; // Sala ainda tem usuários
+    } catch (error) {
+      console.error(`[cleanupEmptyRoom] Erro ao verificar sala ${roomId}:`, error);
+      return false;
+    }
   }
 };
 
@@ -615,14 +639,28 @@ io.on('connection', (socket) => {
         if (room) {
           for (const [userId, user] of room.users.entries()) {
             if (user.socketId === socket.id) {
+              const userName = user.name;
               room.users.delete(userId);
-              await redisHelpers.saveRoom(roomId, room);
+              
+              // Notificar outros usuários antes de verificar se a sala está vazia
               socket.to(roomId).emit('user-left', {
                 userId: userId,
-                userName: user.name
+                userName: userName
               });
-              // Remover usuário do Redis se não estiver em outras salas
+              
+              // Remover usuário do Redis
               await redisHelpers.deleteUser(userId);
+              
+              // Verificar se a sala ficou vazia após remover este usuário
+              if (room.users.size === 0) {
+                // Sala está vazia, excluir
+                await redisHelpers.cleanupEmptyRoom(roomId);
+                console.log(`[disconnect] Sala ${roomId} foi excluída (todos os usuários saíram)`);
+              } else {
+                // Salvar sala atualizada se ainda tiver usuários
+                await redisHelpers.saveRoom(roomId, room);
+              }
+              
               break;
             }
           }
