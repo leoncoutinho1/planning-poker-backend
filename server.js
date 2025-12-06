@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -6,14 +8,20 @@ const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
+
+// Configurar CORS a partir de variável de ambiente
+const corsOrigin = process.env.CORS_ORIGIN || "*";
+const corsOptions = {
+  origin: corsOrigin === "*" ? "*" : (corsOrigin.includes(',') ? corsOrigin.split(',').map(origin => origin.trim()) : corsOrigin),
+  methods: ["GET", "POST"],
+  credentials: true
+};
+
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: corsOptions
 });
 
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Armazenamento em memória (em produção, usar banco de dados)
