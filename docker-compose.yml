@@ -49,9 +49,12 @@ services:
     build:
       context: ../planning-poker-frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+        VITE_SOCKET_URL: ${VITE_SOCKET_URL}
     container_name: planning-poker-frontend
     ports:
-      - "${FRONTEND_PORT:-80}:80"
+      - "${FRONTEND_PORT:-8080}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
@@ -66,3 +69,4 @@ volumes:
 networks:
   planning-poker-network:
     driver: bridge
+
