@@ -5,7 +5,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 const cors = require('cors');
-const { createClient } = require('redis');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
@@ -25,130 +25,362 @@ const io = new Server(server, {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Configurar Redis
-const redisClient = createClient({
-  username: process.env.REDIS_USERNAME || 'default',
-  password: process.env.REDIS_PASSWORD,
-  socket: {
-    host: process.env.REDIS_HOST,
-    port: parseInt(process.env.REDIS_PORT || '6379')
-  }
+// Configurar PostgreSQL
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT || '5432'),
+  database: process.env.DB_NAME || 'planning_poker',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || 'postgres',
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
-redisClient.on('error', err => console.error('Redis Client Error', err));
-redisClient.on('connect', () => console.log('Redis Client Connected'));
-redisClient.on('ready', () => console.log('Redis Client Ready'));
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
+});
 
-// Conectar ao Redis
+// Testar conexão
 (async () => {
   try {
-    if (!redisClient.isOpen) {
-      await redisClient.connect();
-      console.log('Redis conectado com sucesso');
-    }
+    const client = await pool.connect();
+    console.log('PostgreSQL conectado com sucesso');
+    client.release();
   } catch (error) {
-    console.error('Erro ao conectar ao Redis:', error);
-    console.warn('Aplicação continuará sem Redis (modo fallback)');
+    console.error('Erro ao conectar ao PostgreSQL:', error);
+    console.warn('Aplicação continuará tentando conectar...');
   }
 })();
 
-// Helper functions para Redis
-const redisHelpers = {
-  // Verificar se Redis está conectado
-  isConnected() {
-    return redisClient.isReady || redisClient.isOpen;
+// Helper functions para PostgreSQL
+const dbHelpers = {
+  // Verificar se PostgreSQL está conectado
+  async isConnected() {
+    try {
+      const client = await pool.connect();
+      client.release();
+      return true;
+    } catch (error) {
+      return false;
+    }
   },
 
   // Rooms
   async getRoom(roomId) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      // Buscar sala
+      const roomResult = await client.query(
+        'SELECT * FROM rooms WHERE id = $1',
+        [roomId]
+      );
+
+      if (roomResult.rows.length === 0) {
+        return null;
+      }
+
+      const room = roomResult.rows[0];
+
+      // Buscar usuários da sala
+      const usersResult = await client.query(
+        'SELECT id, name, socket_id, vote FROM users WHERE room_id = $1',
+        [roomId]
+      );
+
+      const users = new Map();
+      usersResult.rows.forEach(user => {
+        users.set(user.id, {
+          id: user.id,
+          name: user.name,
+          socketId: user.socket_id,
+          vote: user.vote
+        });
+      });
+
+      // Buscar atividades da sala
+      const activitiesResult = await client.query(
+        'SELECT * FROM activities WHERE room_id = $1 ORDER BY created_at',
+        [roomId]
+      );
+
+      const activities = await Promise.all(
+        activitiesResult.rows.map(async (activity) => {
+          // Buscar votos da atividade
+          const votesResult = await client.query(
+            'SELECT user_id, vote FROM votes WHERE activity_id = $1',
+            [activity.id]
+          );
+
+          const votes = new Map();
+          votesResult.rows.forEach(vote => {
+            votes.set(vote.user_id, vote.vote);
+          });
+
+          return {
+            id: activity.id,
+            title: activity.title,
+            description: activity.description,
+            votes: votes,
+            status: activity.status,
+            result: activity.result ? parseFloat(activity.result) : null
+          };
+        })
+      );
+
+      return {
+        id: room.id,
+        name: room.name,
+        ownerId: room.owner_id,
+        users: users,
+        activities: activities,
+        currentActivityId: room.current_activity_id
+      };
+    } finally {
+      client.release();
     }
-    const data = await redisClient.get(`room:${roomId}`);
-    if (!data) return null;
-    const room = JSON.parse(data);
-    // Converter users de objeto para Map
-    if (room.users) {
-      room.users = new Map(Object.entries(room.users));
-    }
-    // Converter votes de cada atividade de objeto para Map
-    if (room.activities) {
-      room.activities = room.activities.map(activity => ({
-        ...activity,
-        votes: activity.votes ? new Map(Object.entries(activity.votes)) : new Map()
-      }));
-    }
-    return room;
   },
 
   async saveRoom(roomId, room) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Atualizar ou inserir sala
+      await client.query(
+        `INSERT INTO rooms (id, name, owner_id, current_activity_id, updated_at)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           owner_id = EXCLUDED.owner_id,
+           current_activity_id = EXCLUDED.current_activity_id,
+           updated_at = CURRENT_TIMESTAMP`,
+        [roomId, room.name, room.ownerId, room.currentActivityId]
+      );
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-    // Converter Map para objeto para serialização
-    const roomData = {
-      ...room,
-      users: room.users ? Object.fromEntries(room.users) : {},
-      activities: room.activities ? room.activities.map(activity => ({
-        ...activity,
-        votes: activity.votes ? Object.fromEntries(activity.votes) : {}
-      })) : []
-    };
-    await redisClient.set(`room:${roomId}`, JSON.stringify(roomData));
-    // Manter lista de IDs de salas
-    await redisClient.sAdd('rooms:list', roomId);
   },
 
   async deleteRoom(roomId) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      // CASCADE vai deletar usuários, atividades e votos automaticamente
+      await client.query('DELETE FROM rooms WHERE id = $1', [roomId]);
+    } finally {
+      client.release();
     }
-    await redisClient.del(`room:${roomId}`);
-    await redisClient.sRem('rooms:list', roomId);
   },
 
   async getAllRoomIds() {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT id FROM rooms');
+      return result.rows.map(row => row.id);
+    } finally {
+      client.release();
     }
-    return await redisClient.sMembers('rooms:list');
   },
 
   // Users
   async getUser(userId) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT * FROM users WHERE id = $1',
+        [userId]
+      );
+      if (result.rows.length === 0) return null;
+      const user = result.rows[0];
+      return {
+        id: user.id,
+        name: user.name,
+        roomId: user.room_id,
+        socketId: user.socket_id
+      };
+    } finally {
+      client.release();
     }
-    const data = await redisClient.get(`user:${userId}`);
-    return data ? JSON.parse(data) : null;
   },
 
   async saveUser(userId, user) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO users (id, name, room_id, socket_id, vote, updated_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           room_id = EXCLUDED.room_id,
+           socket_id = EXCLUDED.socket_id,
+           vote = EXCLUDED.vote,
+           updated_at = CURRENT_TIMESTAMP`,
+        [userId, user.name, user.roomId, user.socketId || null, user.vote || null]
+      );
+    } finally {
+      client.release();
     }
-    await redisClient.set(`user:${userId}`, JSON.stringify(user));
+  },
+
+  async updateUserSocketId(userId, socketId) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE users SET socket_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [socketId, userId]
+      );
+    } finally {
+      client.release();
+    }
+  },
+
+  async updateUserVote(userId, vote) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE users SET vote = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [vote, userId]
+      );
+    } finally {
+      client.release();
+    }
+  },
+
+  async resetUsersVotes(roomId) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE users SET vote = NULL, updated_at = CURRENT_TIMESTAMP WHERE room_id = $1',
+        [roomId]
+      );
+    } finally {
+      client.release();
+    }
   },
 
   async deleteUser(userId) {
-    if (!this.isConnected()) {
-      throw new Error('Redis não está conectado');
+    const client = await pool.connect();
+    try {
+      await client.query('DELETE FROM users WHERE id = $1', [userId]);
+    } finally {
+      client.release();
     }
-    await redisClient.del(`user:${userId}`);
   },
 
   async getRoomsCount() {
-    if (!this.isConnected()) {
-      return 0;
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT COUNT(*) FROM rooms');
+      return parseInt(result.rows[0].count);
+    } finally {
+      client.release();
     }
-    return await redisClient.sCard('rooms:list');
+  },
+
+  // Activities
+  async createActivity(activityId, roomId, title, description) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'INSERT INTO activities (id, room_id, title, description, status) VALUES ($1, $2, $3, $4, $5)',
+        [activityId, roomId, title, description, 'pending']
+      );
+    } finally {
+      client.release();
+    }
+  },
+
+  async updateActivityStatus(activityId, status, result = null) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'UPDATE activities SET status = $1, result = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
+        [status, result, activityId]
+      );
+    } finally {
+      client.release();
+    }
+  },
+
+  async deleteActivity(activityId) {
+    const client = await pool.connect();
+    try {
+      // CASCADE vai deletar votos automaticamente
+      await client.query('DELETE FROM activities WHERE id = $1', [activityId]);
+    } finally {
+      client.release();
+    }
+  },
+
+  // Votes
+  async saveVote(activityId, userId, vote) {
+    const client = await pool.connect();
+    try {
+      await client.query(
+        `INSERT INTO votes (activity_id, user_id, vote)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (activity_id, user_id) DO UPDATE SET vote = EXCLUDED.vote`,
+        [activityId, userId, vote]
+      );
+    } finally {
+      client.release();
+    }
+  },
+
+  async deleteVotesForActivity(activityId) {
+    const client = await pool.connect();
+    try {
+      await client.query('DELETE FROM votes WHERE activity_id = $1', [activityId]);
+    } finally {
+      client.release();
+    }
+  },
+
+  async getVotesForActivity(activityId) {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT user_id, vote FROM votes WHERE activity_id = $1',
+        [activityId]
+      );
+      const votes = new Map();
+      result.rows.forEach(row => {
+        votes.set(row.user_id, row.vote);
+      });
+      return votes;
+    } finally {
+      client.release();
+    }
+  },
+
+  async getUserBySocketId(socketId) {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT * FROM users WHERE socket_id = $1',
+        [socketId]
+      );
+      if (result.rows.length === 0) return null;
+      const user = result.rows[0];
+      return {
+        id: user.id,
+        name: user.name,
+        roomId: user.room_id,
+        socketId: user.socket_id
+      };
+    } finally {
+      client.release();
+    }
   },
 
   // Verificar e excluir sala se estiver vazia
   async cleanupEmptyRoom(roomId) {
-    if (!this.isConnected()) {
-      return false;
-    }
     try {
       const room = await this.getRoom(roomId);
       if (!room) {
@@ -172,18 +404,19 @@ const redisHelpers = {
 // Health check
 app.get('/health', async (req, res) => {
   try {
-    const roomsCount = await redisHelpers.getRoomsCount();
+    const isConnected = await dbHelpers.isConnected();
+    const roomsCount = await dbHelpers.getRoomsCount();
     res.json({ 
       status: 'ok', 
       timestamp: new Date().toISOString(),
       roomsCount: roomsCount,
-      redis: redisClient.isReady ? 'connected' : 'disconnected'
+      database: isConnected ? 'connected' : 'disconnected'
     });
   } catch (error) {
     res.status(500).json({ 
       status: 'error', 
       message: error.message,
-      redis: redisClient.isReady ? 'connected' : 'disconnected'
+      database: 'error'
     });
   }
 });
@@ -191,10 +424,10 @@ app.get('/health', async (req, res) => {
 // Debug: Listar todas as salas (apenas para desenvolvimento)
 app.get('/api/rooms', async (req, res) => {
   try {
-    const roomIds = await redisHelpers.getAllRoomIds();
+    const roomIds = await dbHelpers.getAllRoomIds();
     const roomsList = await Promise.all(
       roomIds.map(async (roomId) => {
-        const room = await redisHelpers.getRoom(roomId);
+        const room = await dbHelpers.getRoom(roomId);
         if (!room) return null;
         return {
           id: room.id,
@@ -214,27 +447,9 @@ app.get('/api/rooms', async (req, res) => {
   }
 });
 
-// Estrutura de uma sala:
-// {
-//   id: string (UUID),
-//   name: string,
-//   ownerId: string (UUID do criador),
-//   users: Map<userId, { id, name, socketId, vote: null|number }>,
-//   activities: [
-//     {
-//       id: string (UUID),
-//       title: string,
-//       description: string,
-//       votes: Map<userId, number>,
-//       status: 'pending' | 'voting' | 'completed',
-//       result: null | number
-//     }
-//   ],
-//   currentActivityId: string | null
-// }
-
 // Criar uma nova sala
 app.post('/api/rooms', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { name, ownerName } = req.body;
 
@@ -242,30 +457,28 @@ app.post('/api/rooms', async (req, res) => {
       return res.status(400).json({ error: 'Nome da sala e nome do usuário são obrigatórios' });
     }
 
+    await client.query('BEGIN');
+
     const roomId = uuidv4();
     const ownerId = uuidv4();
 
-    const room = {
-      id: roomId,
-      name: name,
-      ownerId: ownerId,
-      users: new Map(),
-      activities: [],
-      currentActivityId: null
-    };
-
-    await redisHelpers.saveRoom(roomId, room);
-    console.log(`[POST /api/rooms] Sala criada: ${roomId} - ${name}`);
-    const roomsCount = await redisHelpers.getRoomsCount();
-    console.log(`[DEBUG] Total de salas após criação: ${roomsCount}`);
+    // Criar sala
+    await client.query(
+      'INSERT INTO rooms (id, name, owner_id) VALUES ($1, $2, $3)',
+      [roomId, name, ownerId]
+    );
 
     // Criar usuário dono da sala
-    const owner = {
-      id: ownerId,
-      name: ownerName,
-      roomId: roomId
-    };
-    await redisHelpers.saveUser(ownerId, owner);
+    await client.query(
+      'INSERT INTO users (id, name, room_id) VALUES ($1, $2, $3)',
+      [ownerId, ownerName, roomId]
+    );
+
+    await client.query('COMMIT');
+
+    console.log(`[POST /api/rooms] Sala criada: ${roomId} - ${name}`);
+    const roomsCount = await dbHelpers.getRoomsCount();
+    console.log(`[DEBUG] Total de salas após criação: ${roomsCount}`);
 
     res.json({
       roomId: roomId,
@@ -274,8 +487,11 @@ app.post('/api/rooms', async (req, res) => {
       shareLink: `${req.protocol}://${req.get('host')}/room/${roomId}`
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('[POST /api/rooms] Erro:', error);
     res.status(500).json({ error: 'Erro ao criar sala', message: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -284,10 +500,10 @@ app.get('/api/rooms/:roomId', async (req, res) => {
   try {
     const { roomId } = req.params;
     console.log(`[GET /api/rooms/${roomId}] Buscando sala...`);
-    const roomsCount = await redisHelpers.getRoomsCount();
-    console.log(`[DEBUG] Total de salas no Redis: ${roomsCount}`);
+    const roomsCount = await dbHelpers.getRoomsCount();
+    console.log(`[DEBUG] Total de salas no PostgreSQL: ${roomsCount}`);
     
-    const room = await redisHelpers.getRoom(roomId);
+    const room = await dbHelpers.getRoom(roomId);
 
     if (!room) {
       console.log(`[ERROR] Sala ${roomId} não encontrada`);
@@ -331,7 +547,7 @@ io.on('connection', (socket) => {
   // Entrar em uma sala
   socket.on('join-room', async ({ roomId, userId, userName }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
@@ -339,7 +555,7 @@ io.on('connection', (socket) => {
       }
 
       // Verificar se o usuário existe
-      let user = await redisHelpers.getUser(userId);
+      let user = await dbHelpers.getUser(userId);
       if (!user) {
         // Criar novo usuário
         user = {
@@ -348,30 +564,28 @@ io.on('connection', (socket) => {
           roomId: roomId,
           socketId: socket.id
         };
-        await redisHelpers.saveUser(userId, user);
+        await dbHelpers.saveUser(userId, user);
       } else {
         // Atualizar socketId do usuário
+        await dbHelpers.updateUserSocketId(userId, socket.id);
         user.socketId = socket.id;
-        await redisHelpers.saveUser(userId, user);
       }
 
       // Adicionar usuário à sala se ainda não estiver
       if (!room.users.has(userId)) {
-        room.users.set(userId, {
-          id: user.id,
-          name: user.name,
+        await dbHelpers.saveUser(userId, {
+          id: userId,
+          name: userName,
+          roomId: roomId,
           socketId: socket.id,
           vote: null
         });
-      } else {
-        // Atualizar socketId se usuário já estiver na sala
-        room.users.get(userId).socketId = socket.id;
       }
 
-      // Salvar sala atualizada
-      await redisHelpers.saveRoom(roomId, room);
-
       socket.join(roomId);
+
+      // Buscar sala atualizada
+      const updatedRoom = await dbHelpers.getRoom(roomId);
 
       // Notificar outros usuários
       socket.to(roomId).emit('user-joined', {
@@ -382,22 +596,22 @@ io.on('connection', (socket) => {
       // Enviar estado atual da sala para o novo usuário
       socket.emit('room-state', {
         room: {
-          id: room.id,
-          name: room.name,
-          ownerId: room.ownerId
+          id: updatedRoom.id,
+          name: updatedRoom.name,
+          ownerId: updatedRoom.ownerId
         },
-        users: Array.from(room.users.values()).map(u => ({
+        users: Array.from(updatedRoom.users.values()).map(u => ({
           id: u.id,
           name: u.name
         })),
-        activities: room.activities.map(a => ({
+        activities: updatedRoom.activities.map(a => ({
           id: a.id,
           title: a.title,
           description: a.description,
           status: a.status,
           result: a.result
         })),
-        currentActivityId: room.currentActivityId
+        currentActivityId: updatedRoom.currentActivityId
       });
 
       console.log(`Usuário ${userName} (${userId}) entrou na sala ${roomId}`);
@@ -410,33 +624,24 @@ io.on('connection', (socket) => {
   // Criar nova atividade
   socket.on('create-activity', async ({ roomId, userId, title, description }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
         return;
       }
 
-      const activity = {
-        id: uuidv4(),
-        title: title || 'Nova Atividade',
-        description: description || '',
-        votes: new Map(),
-        status: 'pending',
-        result: null
-      };
-
-      room.activities.push(activity);
-      await redisHelpers.saveRoom(roomId, room);
+      const activityId = uuidv4();
+      await dbHelpers.createActivity(activityId, roomId, title || 'Nova Atividade', description || '');
 
       io.to(roomId).emit('activity-created', {
-        id: activity.id,
-        title: activity.title,
-        description: activity.description,
-        status: activity.status
+        id: activityId,
+        title: title || 'Nova Atividade',
+        description: description || '',
+        status: 'pending'
       });
 
-      console.log(`Atividade criada na sala ${roomId}: ${activity.title}`);
+      console.log(`Atividade criada na sala ${roomId}: ${title || 'Nova Atividade'}`);
     } catch (error) {
       console.error('[create-activity] Erro:', error);
       socket.emit('error', { message: 'Erro ao criar atividade', details: error.message });
@@ -446,7 +651,7 @@ io.on('connection', (socket) => {
   // Iniciar votação de uma atividade
   socket.on('start-voting', async ({ roomId, userId, activityId }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
@@ -460,16 +665,13 @@ io.on('connection', (socket) => {
       }
 
       // Resetar votos anteriores
-      activity.votes.clear();
-      activity.status = 'voting';
+      await dbHelpers.deleteVotesForActivity(activityId);
+      await dbHelpers.updateActivityStatus(activityId, 'voting');
+      await dbHelpers.resetUsersVotes(roomId);
+
+      // Atualizar currentActivityId da sala
       room.currentActivityId = activityId;
-
-      // Resetar votos dos usuários
-      room.users.forEach(user => {
-        user.vote = null;
-      });
-
-      await redisHelpers.saveRoom(roomId, room);
+      await dbHelpers.saveRoom(roomId, room);
 
       io.to(roomId).emit('voting-started', {
         activityId: activityId,
@@ -477,7 +679,7 @@ io.on('connection', (socket) => {
           id: activity.id,
           title: activity.title,
           description: activity.description,
-          status: activity.status
+          status: 'voting'
         }
       });
 
@@ -491,7 +693,7 @@ io.on('connection', (socket) => {
   // Votar em uma atividade
   socket.on('vote', async ({ roomId, userId, activityId, vote }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
@@ -516,10 +718,8 @@ io.on('connection', (socket) => {
       }
 
       // Registrar voto
-      activity.votes.set(userId, vote);
-      user.vote = vote;
-
-      await redisHelpers.saveRoom(roomId, room);
+      await dbHelpers.saveVote(activityId, userId, vote);
+      await dbHelpers.updateUserVote(userId, vote);
 
       // Notificar todos na sala sobre o voto (sem revelar o valor)
       io.to(roomId).emit('vote-received', {
@@ -530,7 +730,8 @@ io.on('connection', (socket) => {
       });
 
       // Verificar se todos votaram
-      const allUsersVoted = Array.from(room.users.values()).every(u => u.vote !== null);
+      const updatedRoom = await dbHelpers.getRoom(roomId);
+      const allUsersVoted = Array.from(updatedRoom.users.values()).every(u => u.vote !== null);
       if (allUsersVoted) {
         io.to(roomId).emit('all-voted', { activityId: activityId });
       }
@@ -545,7 +746,7 @@ io.on('connection', (socket) => {
   // Revelar resultados
   socket.on('reveal-results', async ({ roomId, userId, activityId }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
@@ -558,20 +759,24 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Buscar votos atualizados
+      const votes = await dbHelpers.getVotesForActivity(activityId);
+
       // Calcular média dos votos
-      const votes = Array.from(activity.votes.values());
-      const average = votes.length > 0
-        ? votes.reduce((sum, vote) => sum + vote, 0) / votes.length
+      const votesArray = Array.from(votes.values());
+      const average = votesArray.length > 0
+        ? votesArray.reduce((sum, vote) => sum + vote, 0) / votesArray.length
         : 0;
 
-      activity.status = 'completed';
-      activity.result = Math.round(average * 10) / 10; // Arredondar para 1 casa decimal
-      room.currentActivityId = null;
+      const result = Math.round(average * 10) / 10; // Arredondar para 1 casa decimal
 
-      await redisHelpers.saveRoom(roomId, room);
+      await dbHelpers.updateActivityStatus(activityId, 'completed', result);
+      
+      room.currentActivityId = null;
+      await dbHelpers.saveRoom(roomId, room);
 
       // Preparar resultados detalhados
-      const results = Array.from(activity.votes.entries()).map(([userId, vote]) => {
+      const results = Array.from(votes.entries()).map(([userId, vote]) => {
         const user = room.users.get(userId);
         return {
           userId: userId,
@@ -582,11 +787,11 @@ io.on('connection', (socket) => {
 
       io.to(roomId).emit('results-revealed', {
         activityId: activityId,
-        result: activity.result,
+        result: result,
         votes: results
       });
 
-      console.log(`Resultados revelados para atividade ${activityId}: ${activity.result}`);
+      console.log(`Resultados revelados para atividade ${activityId}: ${result}`);
     } catch (error) {
       console.error('[reveal-results] Erro:', error);
       socket.emit('error', { message: 'Erro ao revelar resultados', details: error.message });
@@ -596,26 +801,25 @@ io.on('connection', (socket) => {
   // Remover atividade
   socket.on('remove-activity', async ({ roomId, userId, activityId }) => {
     try {
-      const room = await redisHelpers.getRoom(roomId);
+      const room = await dbHelpers.getRoom(roomId);
 
       if (!room) {
         socket.emit('error', { message: 'Sala não encontrada' });
         return;
       }
 
-      const index = room.activities.findIndex(a => a.id === activityId);
-      if (index === -1) {
+      const activity = room.activities.find(a => a.id === activityId);
+      if (!activity) {
         socket.emit('error', { message: 'Atividade não encontrada' });
         return;
       }
 
-      room.activities.splice(index, 1);
+      await dbHelpers.deleteActivity(activityId);
 
       if (room.currentActivityId === activityId) {
         room.currentActivityId = null;
+        await dbHelpers.saveRoom(roomId, room);
       }
-
-      await redisHelpers.saveRoom(roomId, room);
 
       io.to(roomId).emit('activity-removed', { activityId: activityId });
 
@@ -631,38 +835,29 @@ io.on('connection', (socket) => {
     console.log('Usuário desconectado:', socket.id);
 
     try {
-      // Buscar usuário pelo socketId (precisamos iterar sobre todas as salas)
-      const roomIds = await redisHelpers.getAllRoomIds();
+      // Buscar usuário pelo socketId
+      const user = await dbHelpers.getUserBySocketId(socket.id);
       
-      for (const roomId of roomIds) {
-        const room = await redisHelpers.getRoom(roomId);
+      if (user) {
+        const room = await dbHelpers.getRoom(user.roomId);
         if (room) {
-          for (const [userId, user] of room.users.entries()) {
-            if (user.socketId === socket.id) {
-              const userName = user.name;
-              room.users.delete(userId);
-              
-              // Notificar outros usuários antes de verificar se a sala está vazia
-              socket.to(roomId).emit('user-left', {
-                userId: userId,
-                userName: userName
-              });
-              
-              // Remover usuário do Redis
-              await redisHelpers.deleteUser(userId);
-              
-              // Verificar se a sala ficou vazia após remover este usuário
-              if (room.users.size === 0) {
-                // Sala está vazia, excluir
-                await redisHelpers.cleanupEmptyRoom(roomId);
-                console.log(`[disconnect] Sala ${roomId} foi excluída (todos os usuários saíram)`);
-              } else {
-                // Salvar sala atualizada se ainda tiver usuários
-                await redisHelpers.saveRoom(roomId, room);
-              }
-              
-              break;
-            }
+          const userName = user.name;
+          
+          // Notificar outros usuários antes de verificar se a sala está vazia
+          socket.to(user.roomId).emit('user-left', {
+            userId: user.id,
+            userName: userName
+          });
+          
+          // Remover usuário
+          await dbHelpers.deleteUser(user.id);
+          
+          // Verificar se a sala ficou vazia após remover este usuário
+          const updatedRoom = await dbHelpers.getRoom(user.roomId);
+          if (!updatedRoom || updatedRoom.users.size === 0) {
+            // Sala está vazia, excluir
+            await dbHelpers.cleanupEmptyRoom(user.roomId);
+            console.log(`[disconnect] Sala ${user.roomId} foi excluída (todos os usuários saíram)`);
           }
         }
       }
@@ -678,4 +873,3 @@ server.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
   console.log(`Acesse http://localhost:${PORT}`);
 });
-
