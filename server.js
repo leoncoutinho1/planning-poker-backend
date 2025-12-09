@@ -868,8 +868,9 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log(`Acesse http://localhost:${PORT}`);
+  console.log(`Acesse http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
 });
