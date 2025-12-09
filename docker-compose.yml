@@ -50,8 +50,10 @@ services:
       context: ../planning-poker-frontend
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: ${VITE_API_URL}
-        VITE_SOCKET_URL: ${VITE_SOCKET_URL}
+        # URLs vazias fazem o frontend usar URLs relativas através do proxy do nginx
+        # Isso permite acesso externo sem precisar configurar localhost:3000
+        VITE_API_URL: ${VITE_API_URL:-}
+        VITE_SOCKET_URL: ${VITE_SOCKET_URL:-}
     container_name: planning-poker-frontend
     ports:
       - "${FRONTEND_PORT:-8080}:80"
